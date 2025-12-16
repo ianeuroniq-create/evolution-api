@@ -249,6 +249,7 @@ export class BaileysStartupService extends ChannelStartupService {
   private readonly msgRetryCounterCache: CacheStore = new NodeCache();
   private readonly userDevicesCache: CacheStore = new NodeCache({ stdTTL: 300000, useClones: false });
   private endSession = false;
+  private isDeleting = false; // Flag to prevent reconnection during deletion
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
   private eventProcessingQueue: Promise<void> = Promise.resolve();
 
@@ -265,10 +266,27 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async logoutInstance() {
-    this.messageProcessor.onDestroy();
-    await this.client?.logout('Log out instance: ' + this.instanceName);
+    // Mark instance as deleting to prevent reconnection attempts
+    this.isDeleting = true;
+    this.endSession = true;
 
-    this.client?.ws?.close();
+    this.messageProcessor.onDestroy();
+
+    if (this.client) {
+      try {
+        await this.client.logout('Log out instance: ' + this.instanceName);
+      } catch (error) {
+        this.logger.error({ message: 'Error during logout', error });
+      }
+
+      // Improved socket cleanup
+      try {
+        this.client.ws?.close();
+        this.client.end(new Error('Instance logout'));
+      } catch (error) {
+        this.logger.error({ message: 'Error during socket cleanup', error });
+      }
+    }
 
     const db = this.configService.get<Database>('DATABASE');
     const cache = this.configService.get<CacheConf>('CACHE');
@@ -332,6 +350,18 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   private async connectionUpdate({ qr, connection, lastDisconnect }: Partial<ConnectionState>) {
+    // Enhanced logging for connection updates
+    const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
+    this.logger.info({
+      message: 'Connection update received',
+      connection,
+      hasQr: !!qr,
+      statusCode,
+      instanceName: this.instance.name,
+      isDeleting: this.isDeleting,
+      endSession: this.endSession,
+    });
+
     if (qr) {
       if (this.instance.qrcode.count === this.configService.get<QrCode>('QRCODE').LIMIT) {
         this.sendDataWebhook(Events.QRCODE_UPDATED, {
@@ -424,11 +454,29 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     if (connection === 'close') {
+      // Check if instance is being deleted or session is ending
+      if (this.isDeleting || this.endSession) {
+        this.logger.info('Instance is being deleted/ended, skipping reconnection attempt');
+        return;
+      }
+
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
       const codesToNotReconnect = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406];
       const shouldReconnect = !codesToNotReconnect.includes(statusCode);
+
+      this.logger.info({
+        message: 'Connection closed, evaluating reconnection',
+        statusCode,
+        shouldReconnect,
+        instanceName: this.instance.name,
+      });
+
       if (shouldReconnect) {
-        await this.connectToWhatsapp(this.phoneNumber);
+        // Add 3 second delay before reconnection to prevent rapid reconnection loops
+        this.logger.info('Reconnecting in 3 seconds...');
+        setTimeout(async () => {
+          await this.connectToWhatsapp(this.phoneNumber);
+        }, 3000);
       } else {
         this.sendDataWebhook(Events.STATUS_INSTANCE, {
           instance: this.instance.name,
@@ -591,10 +639,11 @@ export class BaileysStartupService extends ChannelStartupService {
       this.logger.info(`Browser: ${browser}`);
     }
 
+    // Fetch latest WhatsApp Web version automatically
     const baileysVersion = await fetchLatestWaWebVersion({});
     const version = baileysVersion.version;
-    const log = `Baileys version: ${version.join('.')}`;
 
+    const log = `Baileys version: ${version.join('.')}`;
     this.logger.info(log);
 
     this.logger.info(`Group Ignore: ${this.localSettings.groupsIgnore}`);
@@ -602,7 +651,7 @@ export class BaileysStartupService extends ChannelStartupService {
     let options;
 
     if (this.localProxy?.enabled) {
-      this.logger.info('Proxy enabled: ' + this.localProxy?.host);
+      this.logger.verbose('Proxy enabled');
 
       if (this.localProxy?.host?.includes('proxyscrape')) {
         try {
@@ -611,9 +660,10 @@ export class BaileysStartupService extends ChannelStartupService {
           const proxyUrls = text.split('\r\n');
           const rand = Math.floor(Math.random() * Math.floor(proxyUrls.length));
           const proxyUrl = 'http://' + proxyUrls[rand];
+          this.logger.info('Proxy url: ' + proxyUrl);
           options = { agent: makeProxyAgent(proxyUrl), fetchAgent: makeProxyAgentUndici(proxyUrl) };
-        } catch {
-          this.localProxy.enabled = false;
+        } catch (error) {
+          this.logger.error(error);
         }
       } else {
         options = {
