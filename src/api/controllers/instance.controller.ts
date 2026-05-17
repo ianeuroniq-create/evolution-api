@@ -36,6 +36,8 @@ export class InstanceController {
 
   public async createInstance(instanceData: InstanceDto) {
     try {
+      instanceData.instanceName = instanceData.instanceName?.trim();
+
       const instance = channelController.init(instanceData, {
         configService: this.configService,
         eventEmitter: this.eventEmitter,
