@@ -115,6 +115,15 @@ export class EvolutionStartupService extends ChannelStartupService {
 
   public async connectToWhatsapp(data?: any): Promise<any> {
     if (!data) {
+      this.stateConnection = { state: 'open' };
+
+      if (this.instanceId) {
+        await this.prismaRepository.instance.update({
+          where: { id: this.instanceId },
+          data: { connectionStatus: 'open' },
+        });
+      }
+
       this.loadChatwoot();
       return;
     }

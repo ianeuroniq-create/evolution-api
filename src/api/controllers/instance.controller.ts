@@ -158,6 +158,10 @@ export class InstanceController {
           getQrcode = instance.qrCode;
         }
 
+        if (instanceData.integration === Integration.EVOLUTION) {
+          await instance.connectToWhatsapp();
+        }
+
         const result = {
           instance: {
             instanceName: instance.instanceName,
