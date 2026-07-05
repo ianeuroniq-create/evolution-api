@@ -1,0 +1,1 @@
+# mantem a pasta patches no git (Dockerfile faz COPY ./patches)
