@@ -49,7 +49,17 @@ export abstract class RouterBroker {
     const instance = request.params as unknown as InstanceDto;
 
     if (request?.query && Object.keys(request.query).length > 0) {
-      Object.assign(instance, sanitizeUntrustedInput(request.query as Record<string, any>));
+      const query = request.query as Record<string, any>;
+      const sanitized = sanitizeUntrustedInput(query);
+      // /instance/fetchInstances has no :instanceName URL param: instanceName and
+      // instanceId in the query are search filters, not overrides. Stripping them
+      // made the global key return every instance. A non-global key stays scoped
+      // by token in InstanceController.fetchInstances, so this widens nothing.
+      if (request.originalUrl.includes('/instance/fetchInstances')) {
+        if (query.instanceName !== undefined) sanitized.instanceName = query.instanceName;
+        if (query.instanceId !== undefined) sanitized.instanceId = query.instanceId;
+      }
+      Object.assign(instance, sanitized);
     }
 
     if (request.originalUrl.includes('/instance/create')) {
