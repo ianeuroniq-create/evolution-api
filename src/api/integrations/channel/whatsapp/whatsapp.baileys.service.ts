@@ -510,7 +510,6 @@ export class BaileysStartupService extends ChannelStartupService {
         instanceName: this.instance.name,
       });
 
-
       if (shouldReconnect) {
         this.logger.warn(`Connection lost (status: ${statusCode}), reconnecting in 3 seconds...`);
         setTimeout(async () => {
