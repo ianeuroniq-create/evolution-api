@@ -483,9 +483,19 @@ export class BaileysStartupService extends ChannelStartupService {
       }
 
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
-      // 408 = request timeout — added per #2501 to avoid reconnect loops on
-      // transient network drops where the server returned a 408 in the close.
-      const codesToNotReconnect = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406, 408];
+      // 408 is ambiguous in Baileys: it is both the QR-code timeout and
+      // DisconnectReason.connectionLost (keepalive miss on a live session).
+      // Upstream (#2501) put 408 in the no-reconnect list to stop QR loops, but
+      // the no-reconnect branch emits logout.instance, whose cleaningUp() deletes
+      // the Session row — so a plain network drop would wipe a paired number's
+      // credentials and force a new QR. Only stop on 408 while the instance has
+      // never been paired, which is the QR-timeout case. wuid is only set on
+      // 'open', so a restored session closing before its first open would look
+      // unpaired: the stored credentials (creds.me) and ownerJid are the proof.
+      const neverPaired =
+        !this.instance.wuid && !this.instance.ownerJid && !this.instance.authState?.state?.creds?.me?.id;
+      const codesToNotReconnect: number[] = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406];
+      if (neverPaired) codesToNotReconnect.push(408);
 
       // FIX: Do not reconnect if it's the initial connection (waiting for QR code)
       // This prevents infinite loop that blocks QR code generation
