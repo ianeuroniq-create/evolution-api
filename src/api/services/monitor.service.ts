@@ -259,6 +259,10 @@ export class WAMonitoringService {
       });
     } catch (error) {
       this.logger.error(error);
+      // Propagate: swallowing this let createInstance() continue without an
+      // Instance row, registering a phantom in-memory instance and surfacing a
+      // misleading Setting_instanceId_fkey error later in the flow.
+      throw error;
     }
   }
 
