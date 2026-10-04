@@ -15,6 +15,12 @@ COPY ./tsup.config.ts ./
 
 RUN npm ci --silent
 
+# Klozzer: repassa o historico de chamadas do WhatsApp (callLogAction) como
+# evento CALL com status 'call_log'. O build FALHA se a Baileys nao for a
+# conferida (7.0.0-rc.9). Origem: klozzer-v2/infra/evolution-chamadas.
+COPY ./Docker/klozzer/patch-chamadas.mjs /opt/klozzer/patch-chamadas.mjs
+RUN node /opt/klozzer/patch-chamadas.mjs /evolution/node_modules/baileys
+
 COPY ./src ./src
 COPY ./public ./public
 COPY ./prisma ./prisma
