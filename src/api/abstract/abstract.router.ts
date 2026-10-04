@@ -32,6 +32,13 @@ function sanitizeUntrustedInput(source: Record<string, any> | undefined): Record
   return sanitized;
 }
 
+// Path only, without the query string: originalUrl.includes() would also match a
+// route name smuggled into the query (?x=/instance/create) on any other route.
+function isRoute(request: Request, route: string): boolean {
+  const path = (request.originalUrl || '').split('?')[0].replace(/\/+$/, '');
+  return path.endsWith(route);
+}
+
 export abstract class RouterBroker {
   constructor() {}
   public routerPath(path: string, param = true) {
@@ -55,14 +62,14 @@ export abstract class RouterBroker {
       // instanceId in the query are search filters, not overrides. Stripping them
       // made the global key return every instance. A non-global key stays scoped
       // by token in InstanceController.fetchInstances, so this widens nothing.
-      if (request.originalUrl.includes('/instance/fetchInstances')) {
+      if (isRoute(request, '/instance/fetchInstances')) {
         if (query.instanceName !== undefined) sanitized.instanceName = query.instanceName;
         if (query.instanceId !== undefined) sanitized.instanceId = query.instanceId;
       }
       Object.assign(instance, sanitized);
     }
 
-    if (request.originalUrl.includes('/instance/create')) {
+    if (isRoute(request, '/instance/create')) {
       const sanitized = sanitizeUntrustedInput(body);
       // /instance/create has no :instanceName URL param — the body is the only
       // source of the name, so it is a required creation input, not an override.
