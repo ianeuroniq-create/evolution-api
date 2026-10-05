@@ -2177,8 +2177,9 @@ export class BaileysStartupService extends ChannelStartupService {
     return this.eventQueueRunner;
   }
 
-  // Each batch races a timer: a hung await (slow DB, giant history sync) no longer
-  // freezes every later batch. The hung step keeps running in the background.
+  // Each batch races a timer. With EVENT_QUEUE_RELEASE_ON_TIMEOUT=true a hung await
+  // (slow DB, giant history sync) no longer freezes every later batch and keeps
+  // running in the background; by default the timeout is only logged.
   private async runQueueStep(step: () => Promise<void>, eventNames: string[]): Promise<void> {
     await this.getEventQueueRunner().runStep(step, eventNames);
   }
@@ -2250,12 +2251,29 @@ export class BaileysStartupService extends ChannelStartupService {
             maxFailures,
             error: (error as Error)?.message ?? String(error),
           }),
-        onUnhealthy: (reason) => this.forceReconnect(reason),
+        onUnhealthy: async (reason) => {
+          if (cfg?.ACTION !== 'reconnect') {
+            // Observe mode: record what would have happened, change nothing.
+            this.logAntiZombie('error', 'heartbeat_unhealthy_observe_only', { reason });
+            return;
+          }
+          await this.forceReconnect(reason);
+        },
         onError: (error) => this.logger.error(error),
       });
     }
 
     this.heartbeat.start();
+    if (this.heartbeat.isRunning) {
+      const cfg = this.configService.get<Heartbeat>('HEARTBEAT');
+      const queue = this.configService.get<EventQueue>('EVENT_QUEUE');
+      this.logAntiZombie('warn', 'anti_zombie_armed', {
+        heartbeatAction: cfg?.ACTION,
+        heartbeatIntervalMs: cfg?.INTERVAL_MS,
+        queueReleaseOnTimeout: !!queue?.RELEASE_ON_TIMEOUT,
+        queueAutoRestart: !!queue?.AUTO_RESTART,
+      });
+    }
   }
 
   public stopHeartbeat() {

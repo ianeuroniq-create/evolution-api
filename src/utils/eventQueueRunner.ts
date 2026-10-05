@@ -12,6 +12,12 @@
 export type EventQueueRunnerConfig = {
   STEP_TIMEOUT_MS: number;
   MAX_CONSECUTIVE_TIMEOUTS: number;
+  /**
+   * true  = on timeout the chain moves on while the hung step keeps running.
+   * false = observe only: the timeout is reported but the chain still waits for
+   *         the step (exactly the behaviour without this runner).
+   */
+  RELEASE_ON_TIMEOUT?: boolean;
 };
 
 export type EventQueueTimeoutInfo = {
@@ -109,6 +115,11 @@ export class EventQueueRunner {
     if (!this.stalled && this.consecutive >= this.config.MAX_CONSECUTIVE_TIMEOUTS) {
       this.stalled = true;
       this.safeHook(() => this.hooks.onStalled(info));
+    }
+
+    if (!this.config.RELEASE_ON_TIMEOUT) {
+      // Observe mode: keep the original ordering guarantee and wait for the step.
+      await stepPromise;
     }
 
     return 'timeout';

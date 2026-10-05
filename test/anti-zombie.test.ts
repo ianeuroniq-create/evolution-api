@@ -23,10 +23,12 @@ async function test(name: string, fn: () => Promise<void>) {
   }
 }
 
-function makeRunner(overrides: Partial<{ STEP_TIMEOUT_MS: number; MAX_CONSECUTIVE_TIMEOUTS: number }> = {}) {
+function makeRunner(
+  overrides: Partial<{ STEP_TIMEOUT_MS: number; MAX_CONSECUTIVE_TIMEOUTS: number; RELEASE_ON_TIMEOUT: boolean }> = {},
+) {
   const log = { errors: [] as unknown[], timeouts: [] as number[], late: [] as number[], stalled: 0, recovered: 0 };
   const runner = new EventQueueRunner(
-    { STEP_TIMEOUT_MS: 40, MAX_CONSECUTIVE_TIMEOUTS: 3, ...overrides },
+    { STEP_TIMEOUT_MS: 40, MAX_CONSECUTIVE_TIMEOUTS: 3, RELEASE_ON_TIMEOUT: true, ...overrides },
     {
       onError: (e) => log.errors.push(e),
       onTimeout: (i) => log.timeouts.push(i.consecutive),
@@ -91,6 +93,44 @@ async function main() {
     assert.equal(log.recovered, 1);
   });
 
+  await test('observe mode (default) logs the timeout but keeps the original order', async () => {
+    const { runner, log } = makeRunner({ RELEASE_ON_TIMEOUT: false });
+    const queue = makeQueue(runner);
+    const ran: string[] = [];
+
+    queue.push(async () => {
+      await sleep(80);
+      ran.push('slow');
+    });
+    queue.push(async () => {
+      ran.push('next');
+    });
+    await queue.tail;
+
+    assert.deepEqual(ran, ['slow', 'next'], 'the next batch still waits for the slow one');
+    assert.deepEqual(log.timeouts, [1], 'the slow step is still reported');
+    assert.equal(log.late.length, 1);
+  });
+
+  await test('observe mode is the default when the flag is absent', async () => {
+    const runner = new EventQueueRunner(
+      { STEP_TIMEOUT_MS: 20, MAX_CONSECUTIVE_TIMEOUTS: 3 },
+      {
+        onError: () => undefined,
+        onTimeout: () => undefined,
+        onLateFinish: () => undefined,
+        onStalled: () => undefined,
+        onRecovered: () => undefined,
+      },
+    );
+    let finished = false;
+    await runner.runStep(async () => {
+      await sleep(50);
+      finished = true;
+    }, ['messages.upsert']);
+    assert.equal(finished, true, 'runStep only returns after the step finished');
+  });
+
   await test('a timed-out step that finishes later is reported (late finish)', async () => {
     const { runner, log } = makeRunner();
     const queue = makeQueue(runner);
@@ -114,7 +154,7 @@ async function main() {
 
   await test('a rejecting step or throwing hook never breaks the chain', async () => {
     const runner = new EventQueueRunner(
-      { STEP_TIMEOUT_MS: 30, MAX_CONSECUTIVE_TIMEOUTS: 1 },
+      { STEP_TIMEOUT_MS: 30, MAX_CONSECUTIVE_TIMEOUTS: 1, RELEASE_ON_TIMEOUT: true },
       {
         onError: () => {
           throw new Error('hook boom');

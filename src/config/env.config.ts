@@ -394,6 +394,8 @@ export type EventQueue = {
   STEP_TIMEOUT_MS: number;
   MAX_CONSECUTIVE_TIMEOUTS: number;
   AUTO_RESTART: boolean;
+  /** false (default) = observe only: a slow step is logged but the queue still waits for it. */
+  RELEASE_ON_TIMEOUT: boolean;
 };
 
 export type Heartbeat = {
@@ -401,6 +403,8 @@ export type Heartbeat = {
   INTERVAL_MS: number;
   MAX_FAILURES: number;
   TIMEOUT_MS: number;
+  /** 'log' (default) = observe only; 'reconnect' = force a session-preserving reconnect. */
+  ACTION: 'log' | 'reconnect';
 };
 
 export type Production = boolean;
@@ -927,12 +931,14 @@ export class ConfigService {
         STEP_TIMEOUT_MS: Number.parseInt(process.env?.EVENT_QUEUE_STEP_TIMEOUT_MS) || 60000,
         MAX_CONSECUTIVE_TIMEOUTS: Number.parseInt(process.env?.EVENT_QUEUE_MAX_CONSECUTIVE_TIMEOUTS) || 3,
         AUTO_RESTART: process.env?.EVENT_QUEUE_AUTO_RESTART === 'true',
+        RELEASE_ON_TIMEOUT: process.env?.EVENT_QUEUE_RELEASE_ON_TIMEOUT === 'true',
       },
       HEARTBEAT: {
         ENABLED: process.env?.HEARTBEAT_ENABLED === undefined || process.env?.HEARTBEAT_ENABLED === 'true',
         INTERVAL_MS: Number.parseInt(process.env?.HEARTBEAT_INTERVAL_MS) || 60000,
         MAX_FAILURES: Number.parseInt(process.env?.HEARTBEAT_MAX_FAILURES) || 3,
         TIMEOUT_MS: Number.parseInt(process.env?.HEARTBEAT_TIMEOUT_MS) || 10000,
+        ACTION: process.env?.HEARTBEAT_ACTION === 'reconnect' ? 'reconnect' : 'log',
       },
     };
   }
