@@ -400,6 +400,9 @@ export class WAMonitoringService {
   private removeInstance() {
     this.eventEmitter.on('remove.instance', async (instanceName: string) => {
       try {
+        // Stop the anti-zombie heartbeat before the instance leaves memory (Baileys only).
+        this.waInstances[instanceName]?.stopHeartbeat?.();
+
         await this.waInstances[instanceName]?.sendDataWebhook(Events.REMOVE_INSTANCE, null);
 
         this.clearDelInstanceTime(instanceName);

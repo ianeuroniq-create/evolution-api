@@ -69,6 +69,8 @@ import {
   configService,
   ConfigSessionPhone,
   Database,
+  EventQueue,
+  Heartbeat,
   Log,
   Openai,
   ProviderSession,
@@ -80,7 +82,9 @@ import ffmpegPath from '@ffmpeg-installer/ffmpeg';
 import { Boom } from '@hapi/boom';
 import { createId as cuid } from '@paralleldrive/cuid2';
 import { Instance, Message } from '@prisma/client';
+import { ConnectionHeartbeat } from '@utils/connectionHeartbeat';
 import { createJid } from '@utils/createJid';
+import { EventQueueRunner } from '@utils/eventQueueRunner';
 import { fetchLatestWaWebVersion } from '@utils/fetchLatestWaWebVersion';
 import { makeProxyAgent, makeProxyAgentUndici } from '@utils/makeProxyAgent';
 import { getOnWhatsappCache, saveOnWhatsappCache } from '@utils/onWhatsappCache';
@@ -92,6 +96,7 @@ import { useMultiFileAuthStateRedisDb } from '@utils/use-multi-file-auth-state-r
 import axios from 'axios';
 import makeWASocket, {
   AnyMessageContent,
+  BaileysEventMap,
   BufferedEventData,
   BufferJSON,
   CacheStore,
@@ -254,6 +259,19 @@ export class BaileysStartupService extends ChannelStartupService {
   private eventProcessingQueue: Promise<void> = Promise.resolve();
   private _lastStream515At = 0;
 
+  // Anti-zombie (event queue step timeout + heartbeat outside the queue).
+  private eventQueueRunner: EventQueueRunner;
+  private heartbeat: ConnectionHeartbeat;
+  private forceReconnectInFlight = false;
+  // Clients replaced by a forced restart: their late connection.update events are
+  // ignored so a stale 'close' cannot tear down / duplicate the replacement socket.
+  private readonly retiredClients = new WeakSet<WASocket>();
+  // Clients whose 'close' was already handed to connectionUpdate() (which owns the
+  // reconnection from there): the force-reconnect fallback must not reload on top.
+  private readonly closeDispatchedClients = new WeakSet<WASocket>();
+  private readonly connectionUpdateSources = new WeakMap<Partial<ConnectionState>, WASocket>();
+  private static readonly FORCE_RECONNECT_FALLBACK_MS = 30_000;
+
   // Cache TTL constants (in seconds)
   private readonly MESSAGE_CACHE_TTL_SECONDS = 5 * 60; // 5 minutes - avoid duplicate message processing
   private readonly UPDATE_CACHE_TTL_SECONDS = 30 * 60; // 30 minutes - avoid duplicate status updates
@@ -274,6 +292,8 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async logoutInstance() {
+    this.stopHeartbeat();
+
     // Mark instance as deleting to prevent reconnection attempts.
     this.isDeleting = true;
     this.endSession = true;
@@ -371,7 +391,10 @@ export class BaileysStartupService extends ChannelStartupService {
     };
   }
 
-  private async connectionUpdate({ qr, connection, lastDisconnect }: Partial<ConnectionState>) {
+  private async connectionUpdate(update: Partial<ConnectionState>) {
+    const { qr, connection, lastDisconnect } = update;
+    if (this.isStaleConnectionUpdate(update)) return;
+
     // Enhanced logging for connection updates
     const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
     this.logger.info({
@@ -552,6 +575,7 @@ export class BaileysStartupService extends ChannelStartupService {
           );
         }
 
+        this.stopHeartbeat();
         this.eventEmitter.emit('logout.instance', this.instance.name, 'inner');
         this.client?.ws?.close();
         this.client.end(new Error('Close connection'));
@@ -804,6 +828,7 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     this.eventHandler();
+    this.startHeartbeat();
 
     this.client.ws.on('CB:call', (packet) => {
       console.log('CB:call', packet);
@@ -1981,143 +2006,343 @@ export class BaileysStartupService extends ChannelStartupService {
   };
 
   private eventHandler() {
+    // The socket this handler belongs to: lets the queue recognise late events of a
+    // client that was already replaced by a forced restart.
+    const sourceClient = this.client;
+
     this.client.ev.process(async (events) => {
-      this.eventProcessingQueue = this.eventProcessingQueue.then(async () => {
-        try {
-          if (!this.endSession) {
-            const database = this.configService.get<Database>('DATABASE');
-            const settings = await this.findSettings();
+      if (events['connection.update']) this.connectionUpdateSources.set(events['connection.update'], sourceClient);
 
-            if (events.call) {
-              const call = events.call[0];
+      this.eventProcessingQueue = this.eventProcessingQueue
+        .then(() => this.runQueueStep(() => this.processEventBatch(events), Object.keys(events)))
+        .catch((error) => this.logger.error(error));
+    });
+  }
 
-              if (settings?.rejectCall && call.status == 'offer') {
-                this.client.rejectCall(call.id, call.from);
-              }
+  private async processEventBatch(events: Partial<BaileysEventMap>) {
+    try {
+      if (!this.endSession) {
+        const database = this.configService.get<Database>('DATABASE');
+        const settings = await this.findSettings();
 
-              if (settings?.msgCall?.trim().length > 0 && call.status == 'offer') {
-                if (call.from.endsWith('@lid')) {
-                  call.from = await this.client.signalRepository.lidMapping.getPNForLID(call.from as string);
-                }
-                const msg = await this.client.sendMessage(call.from, { text: settings.msgCall });
+        if (events.call) {
+          const call = events.call[0];
 
-                this.client.ev.emit('messages.upsert', { messages: [msg], type: 'notify' });
-              }
+          if (settings?.rejectCall && call.status == 'offer') {
+            this.client.rejectCall(call.id, call.from);
+          }
 
-              this.sendDataWebhook(Events.CALL, call);
+          if (settings?.msgCall?.trim().length > 0 && call.status == 'offer') {
+            if (call.from.endsWith('@lid')) {
+              call.from = await this.client.signalRepository.lidMapping.getPNForLID(call.from as string);
             }
+            const msg = await this.client.sendMessage(call.from, { text: settings.msgCall });
 
-            if (events['connection.update']) {
-              this.connectionUpdate(events['connection.update']);
-            }
+            this.client.ev.emit('messages.upsert', { messages: [msg], type: 'notify' });
+          }
 
-            if (events['creds.update']) {
-              this.instance.authState.saveCreds();
-            }
+          this.sendDataWebhook(Events.CALL, call);
+        }
 
-            if (events['messaging-history.set']) {
-              const payload = events['messaging-history.set'];
-              await this.messageHandle['messaging-history.set'](payload);
-            }
+        if (events['connection.update']) {
+          this.connectionUpdate(events['connection.update']);
+        }
 
-            if (events['messages.upsert']) {
-              const payload = events['messages.upsert'];
+        if (events['creds.update']) {
+          this.instance.authState.saveCreds();
+        }
 
-              // this.messageProcessor.processMessage(payload, settings);
-              await this.messageHandle['messages.upsert'](payload, settings);
-            }
+        if (events['messaging-history.set']) {
+          const payload = events['messaging-history.set'];
+          await this.messageHandle['messaging-history.set'](payload);
+        }
 
-            if (events['messages.update']) {
-              const payload = events['messages.update'];
-              await this.messageHandle['messages.update'](payload, settings);
-            }
+        if (events['messages.upsert']) {
+          const payload = events['messages.upsert'];
 
-            if (events['message-receipt.update']) {
-              const payload = events['message-receipt.update'] as MessageUserReceiptUpdate[];
-              const remotesJidMap: Record<string, number> = {};
+          // this.messageProcessor.processMessage(payload, settings);
+          await this.messageHandle['messages.upsert'](payload, settings);
+        }
 
-              for (const event of payload) {
-                if (typeof event.key.remoteJid === 'string' && typeof event.receipt.readTimestamp === 'number') {
-                  remotesJidMap[event.key.remoteJid] = event.receipt.readTimestamp;
-                }
-              }
+        if (events['messages.update']) {
+          const payload = events['messages.update'];
+          await this.messageHandle['messages.update'](payload, settings);
+        }
 
-              await Promise.all(
-                Object.keys(remotesJidMap).map(async (remoteJid) =>
-                  this.updateMessagesReadedByTimestamp(remoteJid, remotesJidMap[remoteJid]),
-                ),
-              );
-            }
+        if (events['message-receipt.update']) {
+          const payload = events['message-receipt.update'] as MessageUserReceiptUpdate[];
+          const remotesJidMap: Record<string, number> = {};
 
-            if (events['presence.update']) {
-              const payload = events['presence.update'];
-
-              if (settings?.groupsIgnore && payload.id.includes('@g.us')) {
-                return;
-              }
-
-              this.sendDataWebhook(Events.PRESENCE_UPDATE, payload);
-            }
-
-            if (!settings?.groupsIgnore) {
-              if (events['groups.upsert']) {
-                const payload = events['groups.upsert'];
-                this.groupHandler['groups.upsert'](payload);
-              }
-
-              if (events['groups.update']) {
-                const payload = events['groups.update'];
-                this.groupHandler['groups.update'](payload);
-              }
-
-              if (events['group-participants.update']) {
-                const payload = events['group-participants.update'] as any;
-                this.groupHandler['group-participants.update'](payload);
-              }
-            }
-
-            if (events['chats.upsert']) {
-              const payload = events['chats.upsert'];
-              this.chatHandle['chats.upsert'](payload);
-            }
-
-            if (events['chats.update']) {
-              const payload = events['chats.update'];
-              this.chatHandle['chats.update'](payload);
-            }
-
-            if (events['chats.delete']) {
-              const payload = events['chats.delete'];
-              this.chatHandle['chats.delete'](payload);
-            }
-
-            if (events['contacts.upsert']) {
-              const payload = events['contacts.upsert'];
-              this.contactHandle['contacts.upsert'](payload);
-            }
-
-            if (events['contacts.update']) {
-              const payload = events['contacts.update'];
-              this.contactHandle['contacts.update'](payload);
-            }
-
-            if (events[Events.LABELS_ASSOCIATION]) {
-              const payload = events[Events.LABELS_ASSOCIATION];
-              this.labelHandle[Events.LABELS_ASSOCIATION](payload, database);
-              return;
-            }
-
-            if (events[Events.LABELS_EDIT]) {
-              const payload = events[Events.LABELS_EDIT];
-              this.labelHandle[Events.LABELS_EDIT](payload);
-              return;
+          for (const event of payload) {
+            if (typeof event.key.remoteJid === 'string' && typeof event.receipt.readTimestamp === 'number') {
+              remotesJidMap[event.key.remoteJid] = event.receipt.readTimestamp;
             }
           }
-        } catch (error) {
-          this.logger.error(error);
+
+          await Promise.all(
+            Object.keys(remotesJidMap).map(async (remoteJid) =>
+              this.updateMessagesReadedByTimestamp(remoteJid, remotesJidMap[remoteJid]),
+            ),
+          );
         }
+
+        if (events['presence.update']) {
+          const payload = events['presence.update'];
+
+          if (settings?.groupsIgnore && payload.id.includes('@g.us')) {
+            return;
+          }
+
+          this.sendDataWebhook(Events.PRESENCE_UPDATE, payload);
+        }
+
+        if (!settings?.groupsIgnore) {
+          if (events['groups.upsert']) {
+            const payload = events['groups.upsert'];
+            this.groupHandler['groups.upsert'](payload);
+          }
+
+          if (events['groups.update']) {
+            const payload = events['groups.update'];
+            this.groupHandler['groups.update'](payload);
+          }
+
+          if (events['group-participants.update']) {
+            const payload = events['group-participants.update'] as any;
+            this.groupHandler['group-participants.update'](payload);
+          }
+        }
+
+        if (events['chats.upsert']) {
+          const payload = events['chats.upsert'];
+          this.chatHandle['chats.upsert'](payload);
+        }
+
+        if (events['chats.update']) {
+          const payload = events['chats.update'];
+          this.chatHandle['chats.update'](payload);
+        }
+
+        if (events['chats.delete']) {
+          const payload = events['chats.delete'];
+          this.chatHandle['chats.delete'](payload);
+        }
+
+        if (events['contacts.upsert']) {
+          const payload = events['contacts.upsert'];
+          this.contactHandle['contacts.upsert'](payload);
+        }
+
+        if (events['contacts.update']) {
+          const payload = events['contacts.update'];
+          this.contactHandle['contacts.update'](payload);
+        }
+
+        if (events[Events.LABELS_ASSOCIATION]) {
+          const payload = events[Events.LABELS_ASSOCIATION];
+          this.labelHandle[Events.LABELS_ASSOCIATION](payload, database);
+          return;
+        }
+
+        if (events[Events.LABELS_EDIT]) {
+          const payload = events[Events.LABELS_EDIT];
+          this.labelHandle[Events.LABELS_EDIT](payload);
+          return;
+        }
+      }
+    } catch (error) {
+      this.logger.error(error);
+    }
+  }
+
+  private logAntiZombie(level: 'warn' | 'error', action: string, data: Record<string, unknown> = {}) {
+    this.logger[level](JSON.stringify({ action, instance: this.instance.name, ...data }));
+  }
+
+  private getEventQueueRunner(): EventQueueRunner {
+    if (!this.eventQueueRunner) {
+      const cfg = this.configService.get<EventQueue>('EVENT_QUEUE');
+      this.eventQueueRunner = new EventQueueRunner(cfg, {
+        onError: (error) => this.logger.error(error),
+        onTimeout: (info) => this.logAntiZombie('error', 'event_queue_step_timeout', info),
+        onLateFinish: (info) => this.logAntiZombie('warn', 'event_queue_step_late_finish', info),
+        onStalled: (info) => {
+          this.logAntiZombie('error', 'event_queue_stalled', info);
+          this.handleEventQueueStalled().catch((error) => this.logger.error(error));
+        },
+        onRecovered: (info) => this.logAntiZombie('warn', 'event_queue_recovered', info),
       });
-    });
+    }
+
+    return this.eventQueueRunner;
+  }
+
+  // Each batch races a timer: a hung await (slow DB, giant history sync) no longer
+  // freezes every later batch. The hung step keeps running in the background.
+  private async runQueueStep(step: () => Promise<void>, eventNames: string[]): Promise<void> {
+    await this.getEventQueueRunner().runStep(step, eventNames);
+  }
+
+  private async handleEventQueueStalled() {
+    const cfg = this.configService.get<EventQueue>('EVENT_QUEUE');
+    if (
+      !cfg?.AUTO_RESTART ||
+      this.stateConnection.state !== 'open' ||
+      this.endSession ||
+      this.isDeleting ||
+      this.forceReconnectInFlight
+    ) {
+      return;
+    }
+
+    this.logAntiZombie('error', 'event_queue_auto_restart');
+    this.getEventQueueRunner().reset();
+    await this.replaceStalledClient();
+  }
+
+  /** Recreates the socket without waiting for the (stuck) queue to process a close. */
+  private async replaceStalledClient() {
+    const oldClient = this.client;
+    if (oldClient) this.retiredClients.add(oldClient);
+
+    // Batches already queued behind the hung step stay on the old chain; the new
+    // socket starts on a fresh one.
+    this.eventProcessingQueue = Promise.resolve();
+
+    try {
+      oldClient?.end(
+        new Boom('anti-zombie: replacing stalled client', { statusCode: DisconnectReason.connectionLost }),
+      );
+    } catch {
+      // ignore — socket may already be closed
+    }
+
+    await this.reloadConnection();
+  }
+
+  // Checked when connectionUpdate() actually runs (a batch may sit behind a hung
+  // step for a long time): updates of a retired socket are ignored, and a 'close'
+  // handed to connectionUpdate() means the normal reconnection path owns it.
+  private isStaleConnectionUpdate(update: Partial<ConnectionState>): boolean {
+    const source = this.connectionUpdateSources.get(update);
+    if (!source) return false;
+
+    if (this.retiredClients.has(source)) {
+      this.logAntiZombie('warn', 'stale_connection_update_ignored', { connection: update.connection });
+      return true;
+    }
+
+    if (update.connection === 'close') this.closeDispatchedClients.add(source);
+
+    return false;
+  }
+
+  public startHeartbeat() {
+    if (!this.heartbeat) {
+      const cfg = this.configService.get<Heartbeat>('HEARTBEAT');
+      this.heartbeat = new ConnectionHeartbeat(cfg, {
+        getClient: () => this.client,
+        canProbe: () =>
+          this.stateConnection.state === 'open' && !this.endSession && !this.isDeleting && !this.forceReconnectInFlight,
+        onProbeFailed: ({ failures, maxFailures, error }) =>
+          this.logAntiZombie('warn', 'heartbeat_failed', {
+            failures,
+            maxFailures,
+            error: (error as Error)?.message ?? String(error),
+          }),
+        onUnhealthy: (reason) => this.forceReconnect(reason),
+        onError: (error) => this.logger.error(error),
+      });
+    }
+
+    this.heartbeat.start();
+  }
+
+  public stopHeartbeat() {
+    this.heartbeat?.stop();
+  }
+
+  /**
+   * Forces a reconnect of a socket that looks open but does not answer, without
+   * depending on the event queue (which may be the thing that is stuck).
+   * Uses 408 (connectionLost): for a paired instance connectionUpdate() reconnects
+   * on 408 and never takes the logout branch that deletes the session.
+   */
+  private async forceReconnect(reason: string) {
+    if (this.forceReconnectInFlight || this.endSession || this.isDeleting) return;
+    this.forceReconnectInFlight = true;
+
+    let fallbackScheduled = false;
+    try {
+      const clientBefore = this.client;
+      this.logAntiZombie('error', 'force_reconnect', { reason });
+
+      try {
+        await this.prismaRepository.instance.update({
+          where: { id: this.instanceId },
+          data: {
+            connectionStatus: 'connecting',
+            disconnectionAt: new Date(),
+            disconnectionReasonCode: DisconnectReason.connectionLost,
+            disconnectionObject: JSON.stringify({ reason }),
+          },
+        });
+      } catch (error) {
+        this.logger.error(error);
+      }
+
+      this.stateConnection = { state: 'connecting', statusReason: DisconnectReason.connectionLost };
+      this.sendDataWebhook(Events.CONNECTION_UPDATE, {
+        instance: this.instance.name,
+        state: 'connecting',
+        statusReason: DisconnectReason.connectionLost,
+      });
+
+      // end() closes the ws itself (after removing its own 'close' listener), so the
+      // close reaches connectionUpdate() with 408, not 428.
+      try {
+        clientBefore?.end(new Boom(`heartbeat: ${reason}`, { statusCode: DisconnectReason.connectionLost }));
+      } catch {
+        // ignore — socket may already be closed
+      }
+      try {
+        clientBefore?.ws?.close();
+      } catch {
+        // ignore
+      }
+
+      const timer = setTimeout(() => {
+        this.forceReconnectFallback(clientBefore)
+          .catch((error) => this.logger.error(error))
+          .finally(() => {
+            this.forceReconnectInFlight = false;
+          });
+      }, BaileysStartupService.FORCE_RECONNECT_FALLBACK_MS);
+      timer.unref?.();
+      fallbackScheduled = true;
+    } catch (error) {
+      this.logger.error(error);
+    } finally {
+      if (!fallbackScheduled) this.forceReconnectInFlight = false;
+    }
+  }
+
+  // Normal path: the close emitted by end() goes through the queue and
+  // connectionUpdate() reconnects. If after 30s it was never handed to
+  // connectionUpdate() (stuck queue), recreate the socket directly.
+  private async forceReconnectFallback(clientBefore: WASocket) {
+    if (
+      this.client !== clientBefore ||
+      this.closeDispatchedClients.has(clientBefore) ||
+      this.stateConnection.state === 'open' ||
+      this.endSession ||
+      this.isDeleting
+    ) {
+      return;
+    }
+
+    this.logAntiZombie('warn', 'force_reconnect_fallback');
+    await this.replaceStalledClient();
   }
 
   private historySyncNotification(msg: proto.Message.IHistorySyncNotification) {

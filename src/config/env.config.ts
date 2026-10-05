@@ -390,6 +390,19 @@ export type EventEmitter = {
   MAX_LISTENERS: number;
 };
 
+export type EventQueue = {
+  STEP_TIMEOUT_MS: number;
+  MAX_CONSECUTIVE_TIMEOUTS: number;
+  AUTO_RESTART: boolean;
+};
+
+export type Heartbeat = {
+  ENABLED: boolean;
+  INTERVAL_MS: number;
+  MAX_FAILURES: number;
+  TIMEOUT_MS: number;
+};
+
 export type Production = boolean;
 
 export interface Env {
@@ -430,6 +443,8 @@ export interface Env {
   FACEBOOK: Facebook;
   SENTRY: Sentry;
   EVENT_EMITTER: EventEmitter;
+  EVENT_QUEUE: EventQueue;
+  HEARTBEAT: Heartbeat;
   PRODUCTION?: Production;
 }
 
@@ -907,6 +922,17 @@ export class ConfigService {
       },
       EVENT_EMITTER: {
         MAX_LISTENERS: Number.parseInt(process.env?.EVENT_EMITTER_MAX_LISTENERS) || 50,
+      },
+      EVENT_QUEUE: {
+        STEP_TIMEOUT_MS: Number.parseInt(process.env?.EVENT_QUEUE_STEP_TIMEOUT_MS) || 60000,
+        MAX_CONSECUTIVE_TIMEOUTS: Number.parseInt(process.env?.EVENT_QUEUE_MAX_CONSECUTIVE_TIMEOUTS) || 3,
+        AUTO_RESTART: process.env?.EVENT_QUEUE_AUTO_RESTART === 'true',
+      },
+      HEARTBEAT: {
+        ENABLED: process.env?.HEARTBEAT_ENABLED === undefined || process.env?.HEARTBEAT_ENABLED === 'true',
+        INTERVAL_MS: Number.parseInt(process.env?.HEARTBEAT_INTERVAL_MS) || 60000,
+        MAX_FAILURES: Number.parseInt(process.env?.HEARTBEAT_MAX_FAILURES) || 3,
+        TIMEOUT_MS: Number.parseInt(process.env?.HEARTBEAT_TIMEOUT_MS) || 10000,
       },
     };
   }
