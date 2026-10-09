@@ -522,7 +522,15 @@ export class BaileysStartupService extends ChannelStartupService {
 
       // FIX: Do not reconnect if it's the initial connection (waiting for QR code)
       // This prevents infinite loop that blocks QR code generation
-      const isInitialConnection = !this.instance.wuid && (this.instance.qrcode?.count ?? 0) === 0;
+      // A restored session (container restart) has no wuid until its first
+      // 'open', but it IS paired: ownerJid comes from the DB and creds.me from
+      // the stored auth state. Using `!wuid` alone treated every restored
+      // number as "waiting for QR", so a close before the first open returned
+      // here without reconnecting and the number stayed down until someone
+      // called /instance/connect (incident of 05-08/10/2026: after each restart
+      // dozens of paired numbers went connecting -> close and never retried).
+      // Same pairing proof as `neverPaired` above.
+      const isInitialConnection = neverPaired && (this.instance.qrcode?.count ?? 0) === 0;
 
       if (isInitialConnection) {
         this.logger.info('Initial connection closed, waiting for QR code generation...');
