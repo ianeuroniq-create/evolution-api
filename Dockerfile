@@ -21,6 +21,13 @@ RUN npm ci --silent
 COPY ./Docker/klozzer/patch-chamadas.mjs /opt/klozzer/patch-chamadas.mjs
 RUN node /opt/klozzer/patch-chamadas.mjs /evolution/node_modules/baileys
 
+# Klozzer: confirma (ack) a estrofe <status> que o WhatsApp manda solta desde
+# set/2026. Sem isso o servidor derruba o número a cada ~50 min e ele fica
+# "open" sem receber nada (a zumbi). Baileys #2858 / Evolution #2778. O build
+# FALHA se a Baileys nao for a 7.0.0-rc.9 ou se a ancora nao bater.
+COPY ./Docker/klozzer/patch-status-ack.mjs /opt/klozzer/patch-status-ack.mjs
+RUN node /opt/klozzer/patch-status-ack.mjs /evolution/node_modules/baileys
+
 COPY ./src ./src
 COPY ./public ./public
 COPY ./prisma ./prisma
